@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+hik-config.log
+*.log
+backups/
+results*.json
+cameras.csv
+cameras.yaml
+cameras.yml
+cameras.json
+!examples/cameras.*
