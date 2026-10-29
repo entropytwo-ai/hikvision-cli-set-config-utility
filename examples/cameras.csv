@@ -1,0 +1,5 @@
+# ip,username,password,port are the standard columns. Optional: name,https,auth,channel,new_ip
+ip,username,password,port,name
+192.168.1.100,admin,ChangeMe123!,80,Lobby
+192.168.1.101,admin,ChangeMe123!,80,Parking
+192.168.1.102,admin,ChangeMe123!,8080,Warehouse
