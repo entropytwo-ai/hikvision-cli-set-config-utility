@@ -19,6 +19,12 @@ Version: 2.0.0. This is a full rewrite of the original single-purpose `set-hik-n
   - [JSON](#json)
   - [Optional Fields](#optional-fields)
   - [Selecting Cameras Without a File](#selecting-cameras-without-a-file)
+- [Discovering Cameras (`scan`)](#discovering-cameras-scan)
+  - [How Discovery Works](#how-discovery-works)
+  - [Scan Examples](#scan-examples)
+  - [Building a Camera List From a Scan](#building-a-camera-list-from-a-scan)
+  - [SADP Multicast Discovery](#sadp-multicast-discovery)
+  - [Scan Options](#scan-options)
 - [Commands](#commands)
   - [Global Options](#global-options)
   - [NTP](#ntp)
@@ -68,10 +74,12 @@ results are printed as one readable block, followed by a summary of successes an
 | System | `get-info`, `get-status` | `set-device-name`, `reboot`, `restore-defaults`, `backup-config` |
 | Email / SMTP | `get-email` | `set-email`: SMTP server, port, TLS, auth, sender, recipients, motion email on/off |
 | PTZ | `get-ptz-presets` | `call-preset`, `set-preset`, `delete-preset` |
+| Discovery | `scan` (active probe + SADP) | writes a camera list file |
 | Everything | `get-all` | `raw` (any ISAPI request) |
 
 Other features:
 
+- **Camera discovery:** [`scan`](#discovering-cameras-scan) sweeps IPs/subnets (and/or SADP multicast) to find cameras when you don't have a list, and writes one in any supported format.
 - **Concurrent:** cameras run in a thread pool (`--workers`, default 8).
 - **Readable per-camera logs:** output from different cameras never interleaves. Each run also writes a log file with timestamps and can export results to JSON.
 - **Digest and Basic authentication:** `auto` mode tries Digest first and switches to Basic if the camera only offers Basic.
@@ -243,6 +251,166 @@ python3 hik_config.py get-info --ip 192.168.1.10-192.168.2.20 -u admin     # ful
 python3 hik_config.py get-info --ip 10.0.5.0/27 -u admin                   # CIDR
 python3 hik_config.py get-info -c cameras.yaml --ip 10.0.9.5 -u admin      # file + extra IPs
 ```
+
+[↑ Back to Contents](#table-of-contents)
+
+---
+
+## Discovering Cameras (`scan`)
+
+Don't have a camera list, or don't know which IPs your cameras use? The `scan`
+command sweeps one or more IPs/subnets, identifies every ISAPI-compatible camera
+(Hikvision and the many OEM/clone brands that speak the same protocol), and can
+write the results straight into a ready-to-use camera list file.
+
+```bash
+# Scan a whole /24 and save everything it finds as a YAML camera list
+python3 hik_config.py scan --ip 192.168.1.0/24 -o cameras.yaml
+
+# Scan a range on ports 80 and 443, log in to read model/firmware, save as CSV
+python3 hik_config.py scan --ip 192.168.1.10-50 --ports 80,443 \
+    -u admin -p 'MyPassword!' -o cameras.csv
+```
+
+[↑ Back to Contents](#table-of-contents)
+
+### How Discovery Works
+
+For every `IP:port` target, `scan`:
+
+1. Does a quick **TCP connect** to see whether the port is open (closed hosts are
+   skipped fast, so scanning a full subnet is quick).
+2. Requests **`/ISAPI/System/deviceInfo`** without credentials:
+   - **HTTP 200** with a valid `DeviceInfo` document → an **open camera**; the
+     model, serial, firmware, MAC and name are read directly.
+   - **HTTP 401** → a **credential-protected ISAPI camera**. It is recorded as a
+     camera that *needs login*. If you supply `-u/-p`, `scan` authenticates and
+     reads its details too.
+   - **any other response** → a web server that is **not** an ISAPI camera (listed
+     only with `--show-all`).
+3. Classifies the vendor from the model prefix (`DS-` → Hikvision, etc.) or the
+   `Server:`/auth realm when the model isn't readable.
+
+Each host prints a single line as it is probed, and a summary is shown at the end:
+
+```
+════════════════════════════════════════════════════════════
+SCAN  (254 target(s))
+════════════════════════════════════════════════════════════
+  ✓ 192.168.1.64  DS-2CD2143G2-I fw V5.7.3 "Front Door"
+  ✓ 192.168.1.65  DS-2CD2347G2 fw V5.7.3 "Driveway"
+  ! 192.168.1.70  ISAPI device - authentication required (supply -u/-p to read details)
+  • 192.168.1.1   HTTP 200 but not an ISAPI deviceInfo (Server: lighttpd)
+
+════════════════════════════════════════════════════════════
+SCAN SUMMARY
+════════════════════════════════════════════════════════════
+  Targets probed    : 254 (254 host(s) x 1 port(s))
+  Cameras found     : 3
+    - readable       : 2
+    - need login     : 1
+  Other open hosts  : 1
+  Camera list       : cameras.yaml
+════════════════════════════════════════════════════════════
+```
+
+> **Scope / etiquette:** `scan` probes only the exact addresses you give it, with
+> one ordinary ISAPI request per host — it is a device-discovery helper for *your
+> own* network, not a stealth port scanner. Only scan networks you are authorised
+> to.
+
+[↑ Back to Contents](#table-of-contents)
+
+### Scan Examples
+
+```bash
+# Single IP, is it a camera?
+python3 hik_config.py scan --ip 192.168.1.64
+
+# A range, shorthand end (.10 - .50)
+python3 hik_config.py scan --ip 192.168.1.10-50
+
+# Several subnets at once, non-standard ports
+python3 hik_config.py scan --ip 10.0.1.0/24 --ip 10.0.2.0/24 --ports 80,8000
+
+# Authenticate so model/firmware/serial are filled in
+python3 hik_config.py scan --ip 192.168.1.0/24 -u admin -p 'MyPassword!'
+
+# HTTPS cameras on 443
+python3 hik_config.py scan --ip 192.168.1.0/24 --https --ports 443
+
+# Also list closed/unreachable hosts and dump a full JSON report
+python3 hik_config.py scan --ip 192.168.1.0/24 --show-all --json-out scan-report.json
+```
+
+[↑ Back to Contents](#table-of-contents)
+
+### Building a Camera List From a Scan
+
+Add `-o FILE` and the discovered cameras are written as a camera list in the format
+chosen by the file extension (`.csv`, `.yaml`/`.yml` or `.json`). The file loads
+straight back into every other command:
+
+```bash
+# 1. Discover and save (model/serial/firmware included as extra columns)
+python3 hik_config.py scan --ip 192.168.1.0/24 -u admin -p 'MyPassword!' -o cameras.yaml
+
+# 2. Use the generated list immediately
+python3 hik_config.py get-all   -c cameras.yaml -p 'MyPassword!'
+python3 hik_config.py set-ntp    -c cameras.yaml -p 'MyPassword!' --server pool.ntp.org
+```
+
+Notes:
+
+- Only devices identified as cameras are written (plain web servers are skipped).
+- `-u/--username` is saved in the file; the **password is not** unless you add
+  `--save-credentials` (otherwise pass `-p` when you run later commands, or set
+  `HIK_PASSWORD`).
+- Add `--no-meta` to omit the `vendor`/`model`/`serial`/`firmware`/`mac` columns
+  and keep the file minimal.
+
+[↑ Back to Contents](#table-of-contents)
+
+### SADP Multicast Discovery
+
+`--sadp` additionally runs Hikvision's **SADP** discovery — the same multicast
+(`239.255.255.250:37020`) mechanism the official SADP tool uses. It finds devices
+even when their IP is unknown or mis-configured (e.g. a brand-new camera still on
+the wrong subnet), **but only on the local layer-2 segment** (multicast is not
+routed, so it cannot see cameras behind a router or VPN).
+
+```bash
+# Multicast discovery only
+python3 hik_config.py scan --sadp
+
+# Combine: multicast + an active probe of a subnet, merged into one list
+python3 hik_config.py scan --sadp --ip 192.168.1.0/24 -u admin -p 'MyPassword!' -o cameras.json
+```
+
+If the SADP UDP port is unavailable (e.g. the official SADP tool is already
+running, or the platform blocks it) the scan reports it and continues with the
+active probe.
+
+[↑ Back to Contents](#table-of-contents)
+
+### Scan Options
+
+| Option | Description |
+| --- | --- |
+| `--ip IP\|RANGE\|CIDR` | Target(s): single IP, range (`.10-50` or full), or CIDR. Repeatable. |
+| `--ports LIST` | Port(s) to probe, e.g. `80,443,8000-8010` (default `80`). |
+| `-u`, `-p` | Credentials — optional; enable reading model/firmware of protected cameras. |
+| `--auth {auto,digest,basic}` | HTTP auth method (default `auto`). |
+| `--https` / `--verify-tls` | Probe over HTTPS / verify certificates. |
+| `--timeout` / `--tcp-timeout` | Per-host HTTP timeout / TCP pre-check timeout (seconds). |
+| `-w`, `--workers` | Hosts probed in parallel (default `32`). |
+| `-o`, `--out FILE` | Write discovered cameras to `.csv`/`.yaml`/`.json`. |
+| `--save-credentials` | Include the password in the written file. |
+| `--no-meta` | Omit model/serial/firmware/mac columns. |
+| `--json-out FILE` | Write the full scan report (all hosts) as JSON. |
+| `--show-all` | Also list closed/unreachable and non-camera hosts. |
+| `--sadp` / `--sadp-timeout` | Also run SADP multicast discovery / listen time (seconds). |
+| `--no-color`, `--log-file`, `--no-log-file` | Output/logging controls (as elsewhere). |
 
 [↑ Back to Contents](#table-of-contents)
 
@@ -706,7 +874,8 @@ python3 hik_config.py get-info --ip 10.1.1.20 --port 8443 --https --auth basic -
 hik_config.py              CLI entry point (argparse subcommands, camera selection, confirmation)
 modules/
   camera_client.py         CameraClient: ISAPI session, Digest/Basic auth, errors, XML helpers
-  camera_loader.py         CSV / YAML / JSON camera loader, IP ranges
+  camera_loader.py         CSV / YAML / JSON camera loader + writer, IP ranges
+  discovery.py             Network scan: TCP/ISAPI probe + SADP multicast discovery
   worker.py                ThreadPoolExecutor runner, per-camera log blocks, summary, JSON export
   common.py                argparse helpers shared by modules
   ntp.py  time_date.py  network.py  video.py  recording.py  osd.py
