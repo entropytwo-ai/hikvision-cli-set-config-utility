@@ -13,7 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import hik_config  # noqa: E402
 import mock_camera  # noqa: E402
-from modules.camera_loader import CameraFileError, expand_ip_range, load_cameras  # noqa: E402
+from modules import discovery  # noqa: E402
+from modules.camera_loader import (CameraFileError, expand_ip_range, load_cameras,  # noqa: E402
+                                   write_camera_file)
 from modules.motion import count_active_cells, grid_map  # noqa: E402
 from modules.time_date import build_timezone, parse_timezone  # noqa: E402
 
@@ -107,6 +109,98 @@ class MockCameraTests(unittest.TestCase):
     def test_restore_defaults_requires_confirm(self):
         code, _ = run("restore-defaults", *self.base())
         self.assertNotEqual(code, 0)
+
+    # ── scan / discovery ──────────────────────────────────────────────────────
+    def test_scan_needs_auth_without_credentials(self):
+        code, out = run("scan", "--ip", "127.0.0.1", "--ports", "18181,18182",
+                        "--no-color", "--no-log-file", "--timeout", "2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("authentication required"), 2)
+        self.assertIn("Cameras found     : 2", out)
+        self.assertIn("need login     : 2", out)
+
+    def test_scan_authenticated_reads_model(self):
+        code, out = run("scan", "--ip", "127.0.0.1", "--ports", "18181,18182",
+                        "-u", "admin", "-p", PW, "--no-color", "--no-log-file", "--timeout", "2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("DS-2CD2143G2-I"), 2)
+        self.assertIn("readable       : 2", out)
+
+    def test_scan_skips_closed_ports_and_writes_file(self):
+        for ext in ("yaml", "json", "csv"):
+            path = os.path.join(self.tmp, f"found.{ext}")
+            # 18199 is closed -> must not appear as a camera
+            code, out = run("scan", "--ip", "127.0.0.1", "--ports", "18181,18199",
+                            "-u", "admin", "-p", PW, "-o", path,
+                            "--no-color", "--no-log-file", "--timeout", "2")
+            self.assertEqual(code, 0, out)
+            cams = load_cameras(path)
+            self.assertEqual([c.effective_port for c in cams], [18181], ext)
+            self.assertEqual(cams[0].extra.get("model"), "DS-2CD2143G2-I", ext)
+
+    def test_scan_nothing_to_scan_is_error(self):
+        code, _ = run("scan", "--no-color", "--no-log-file")
+        self.assertEqual(code, 2)
+
+
+class DiscoveryHelperTests(unittest.TestCase):
+    def test_parse_ports(self):
+        self.assertEqual(discovery.parse_ports("80"), [80])
+        self.assertEqual(discovery.parse_ports("80,443,80"), [80, 443])
+        self.assertEqual(discovery.parse_ports("8000-8002,80"), [80, 8000, 8001, 8002])
+        with self.assertRaises(ValueError):
+            discovery.parse_ports("70000")
+        with self.assertRaises(ValueError):
+            discovery.parse_ports("20-10")
+
+    def test_expand_targets(self):
+        self.assertEqual(discovery.expand_targets(["10.0.0.5"]), ["10.0.0.5"])
+        self.assertEqual(discovery.expand_targets(["10.0.0.1-3"]),
+                         ["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertEqual(len(discovery.expand_targets(["10.0.0.0/30"])), 2)   # usable hosts
+        self.assertEqual(discovery.expand_targets(["10.0.0.9/32"]), ["10.0.0.9"])
+        # de-duplication across overlapping specs
+        self.assertEqual(discovery.expand_targets(["10.0.0.1", "10.0.0.1-2"]),
+                         ["10.0.0.1", "10.0.0.2"])
+
+    def test_devices_to_records_filters_non_cameras(self):
+        cam = discovery.DiscoveredDevice(ip="10.0.0.5", port=80, is_camera=True,
+                                         authenticated=True, model="DS-X", name="Cam")
+        web = discovery.DiscoveredDevice(ip="10.0.0.6", port=80, tcp_open=True, is_camera=False)
+        recs = discovery.devices_to_records([cam, web], username="admin")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["ip"], "10.0.0.5")
+        self.assertEqual(recs[0]["username"], "admin")
+        self.assertEqual(recs[0]["model"], "DS-X")
+        self.assertNotIn("password", recs[0])
+
+    def test_write_camera_file_roundtrip_all_formats(self):
+        tmp = tempfile.mkdtemp()
+        recs = [{"ip": "10.0.0.5", "port": 8080, "username": "admin", "name": "Cam",
+                 "model": "DS-X"},
+                {"ip": "10.0.0.6", "https": True, "model": "DS-Y"}]
+        for ext in ("csv", "yaml", "json"):
+            path = os.path.join(tmp, f"c.{ext}")
+            write_camera_file(path, recs, header_comment="test")
+            cams = load_cameras(path)
+            self.assertEqual([c.ip for c in cams], ["10.0.0.5", "10.0.0.6"], ext)
+            self.assertEqual(cams[0].effective_port, 8080, ext)
+            self.assertTrue(cams[1].https, ext)
+            self.assertEqual(cams[0].extra.get("model"), "DS-X", ext)
+
+    def test_sadp_parse(self):
+        xml = (b'<?xml version="1.0" encoding="utf-8"?>'
+               b'<ProbeMatch><IPv4Address>192.168.1.64</IPv4Address><HttpPort>80</HttpPort>'
+               b'<DeviceDescription>IPC</DeviceDescription><DeviceType>IPCamera</DeviceType>'
+               b'<DeviceSN>DS-2CD2143G2-I20230101</DeviceSN><SoftwareVersion>V5.7.3</SoftwareVersion>'
+               b'<MAC>bc:ba:c2:00:00:01</MAC></ProbeMatch>')
+        dev = discovery._sadp_parse(xml)
+        self.assertIsNotNone(dev)
+        self.assertEqual(dev.ip, "192.168.1.64")
+        self.assertEqual(dev.port, 80)
+        self.assertEqual(dev.serial, "DS-2CD2143G2-I20230101")
+        self.assertTrue(dev.is_camera)
+        self.assertIsNone(discovery._sadp_parse(b"not xml"))
 
 
 class HelperTests(unittest.TestCase):

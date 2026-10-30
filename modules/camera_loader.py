@@ -173,6 +173,69 @@ def load_cameras(path: str) -> List[Camera]:
     return cameras
 
 
+def write_camera_file(path: str, records: List[Dict[str, Any]], *,
+                      header_comment: Optional[str] = None) -> None:
+    """Write camera records to a CSV/YAML/JSON file (format chosen by extension).
+
+    ``records`` is a list of plain dicts (e.g. from
+    ``discovery.devices_to_records``). The resulting file can be loaded straight
+    back with :func:`load_cameras`.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in LOADERS:
+        raise CameraFileError(
+            f"Unsupported output type '{ext}'. Use .csv, .yaml, .yml or .json")
+    if not records:
+        raise CameraFileError("no cameras to write")
+
+    if ext == ".csv":
+        # Union of all keys, with the common fields first in a stable order.
+        preferred = ["ip", "port", "https", "username", "password", "name",
+                     "vendor", "model", "serial", "firmware", "mac"]
+        extra = [k for r in records for k in r if k not in preferred]
+        seen = set()
+        columns = [c for c in preferred if any(c in r for r in records)]
+        for k in extra:
+            if k not in seen and k not in columns:
+                seen.add(k)
+                columns.append(k)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            if header_comment:
+                fh.write(f"# {header_comment}\n")
+            writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for rec in records:
+                writer.writerow({k: _csv_cell(rec.get(k)) for k in columns})
+        return
+
+    if ext in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            raise CameraFileError("PyYAML is required to write YAML: pip install pyyaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            if header_comment:
+                fh.write(f"# {header_comment}\n")
+            yaml.safe_dump({"cameras": records}, fh, sort_keys=False, default_flow_style=False,
+                           allow_unicode=True)
+        return
+
+    # JSON
+    with open(path, "w", encoding="utf-8") as fh:
+        payload: Dict[str, Any] = {}
+        if header_comment:
+            payload["_comment"] = header_comment
+        payload["cameras"] = records
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return "" if value is None else value
+
+
 def expand_ip_range(spec: str) -> List[str]:
     """Expand '192.168.1.10-20', '192.168.1.10-192.168.1.20' or a CIDR '192.168.1.0/28'."""
     spec = spec.strip()
