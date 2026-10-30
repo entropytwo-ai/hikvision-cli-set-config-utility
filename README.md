@@ -5,6 +5,12 @@ standard **ISAPI** REST interface, without logging into each web UI and without 
 
 Version: 2.0.0. This is a full rewrite of the original single-purpose `set-hik-ntp.py` script.
 
+<table><tr>
+<td><img src=".github/donate-bitcoin-qr.png" width="96" alt="Bitcoin donation QR code"></td>
+<td><sub>💛 If you find this project useful, I'd be grateful for any donation. Thank you!<br>
+<b>Bitcoin:</b> <code>bc1qu6dkcchurnutgc40y6n53s3zm588z9nnkm2ygq</code></sub></td>
+</tr></table>
+
 ## Table of Contents
 
 - [Overview](#overview)
